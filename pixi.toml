@@ -1,0 +1,18 @@
+[workspace]
+authors = ["recynie <littledai_oursky@163.com>"]
+channels = ["conda-forge"]
+name = "C4-AIGC"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+serve="flask --app main.py run"
+debug="flask --app main.py run --debug"
+
+[dependencies]
+aiohttp = ">=3.12.13,<4"
+requests = ">=2.32.4,<3"
+
+[pypi-dependencies]
+python-dotenv="*"
+Flask="*"
