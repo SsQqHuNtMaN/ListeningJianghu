@@ -1,18 +1,23 @@
-__version__="1.0.0"
-
+"""
+不再将document_transcript挂载到路由
+作为内部函数使用，返回一个生成器，用于把文本传递给tts部分
+为调试方便，包装document_transcript为document_transcript_endpoint作为路由
+"""
 import os
 import logging
 import uuid
-from flask import Blueprint, request, Response, stream_with_context, current_app
+from flask import Blueprint, request, current_app
 from werkzeug.utils import secure_filename
 from ..api import VivoGPTAPI
 import shutil
+
+__version__="2.0.0"  
 
 # 配置日志
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-transcripts_bp = Blueprint('transcripts', __name__,url_prefix='/reader/transcripts')
+transcripts_bp = Blueprint('transcripts', __name__, url_prefix='/reader/transcripts')
 doc_db={}
 
 # --- 配置 ---
@@ -162,7 +167,7 @@ def _get_llm_transcript_chunk(client: VivoGPTAPI, context: str, content_chunk: s
         logger.error(f"Error calling LLM for chunk: {e}", exc_info=True)
         return e
 
-def _stream_transcription_process(document_id: str, full_text: str):
+def _transcription_process(document_id: str, full_text: str):
     """
     处理整个长文本，使用滑动窗口进行分块，并逐步调用 LLM 进行转述，
     然后将结果流式输出。
@@ -190,9 +195,6 @@ def remove_all_documents():
     shutil.rmtree(UPLOAD_FOLDER)
 
 # def get_document_id()
-
-
-# --- Flask 路由 ---
 
 @transcripts_bp.before_app_request
 def setup_folders():
@@ -246,10 +248,10 @@ def upload_document():
         logger.error(f"Failed to save file {original_filename} to {filepath}: {e}", exc_info=True)
         return f"Error: Failed to save file - {str(e)}", 500
 
-@transcripts_bp.route("/documents/<document_id>/stream-transcript", methods=['GET'])
-def stream_document_transcript(document_id):
+# @transcripts_bp.route("/documents/<document_id>/stream-transcript", methods=['GET'])
+def document_transcript(document_id):
     """
-    根据文档 ID 流式输出其评书风格的文字稿。
+    根据文档 ID 输出其评书风格的文字稿。返回一个生成器。
     """
     app_root = current_app.root_path
     upload_dir_path = os.path.join(app_root, UPLOAD_FOLDER)
@@ -270,8 +272,8 @@ def stream_document_transcript(document_id):
             full_text = f.read()
         
         logger.info(f"Starting streaming transcription for document ID: {document_id}")
-        return Response(stream_with_context(_stream_transcription_process(document_id, full_text)), mimetype='text/plain')
-        # return _stream_transcription_process(document_id, full_text)
+        # return Response(stream_with_context(_stream_transcription_process(document_id, full_text)), mimetype='text/plain')
+        return _transcription_process(document_id, full_text)
 
     except IOError as e:
         logger.error(f"Failed to read original document {original_filepath} for streaming: {e}", exc_info=True)
@@ -279,6 +281,11 @@ def stream_document_transcript(document_id):
     except Exception as e:
         logger.error(f"An unexpected error occurred before starting stream for document ID {document_id}: {e}", exc_info=True)
         return f"Error: An unexpected server error occurred - {str(e)}", 500
+
+@transcripts_bp.route("/documents/<document_id>/stream-transcript", methods=['GET'])
+def document_transcript_endpoint(document_id):
+    from flask import Response,stream_with_context
+    return Response(stream_with_context(document_transcript(document_id)), mimetype='text/plain')
 
 @transcripts_bp.app_errorhandler(413)
 def request_entity_too_large(error):
