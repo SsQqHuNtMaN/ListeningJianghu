@@ -10,21 +10,22 @@ from flask import Blueprint, request, current_app
 from werkzeug.utils import secure_filename
 from ..api import VivoGPTAPI
 import shutil
+from rapidfuzz import fuzz
+import json
 
-__version__="2.0.0"  
+__version__="2.1.0"  
 
 # 配置日志
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 transcripts_bp = Blueprint('transcripts', __name__, url_prefix='/reader/transcripts')
-doc_db={}
 
 # --- 配置 ---
 UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'txt', 'md'}
 MAX_CONTENT_LENGTH = 32 * 1024 * 1024 # 增大文件限制到 32MB
-
+DOCUMENT_MAPPER_JSONL="map.jsonl"
 # 滑动窗口配置
 WINDOW_SIZE_CHARS = 2000 # 窗口总长度（字符），包含上下文和待转述文本
 TRANSCRIBE_CHUNK_SIZE_CHARS = 1000 # 每次待转述的文本长度（字符）
@@ -71,6 +72,92 @@ CONVERT_PROMPT_NO_CONTEXT = """
 {}
 ###
 """
+
+class DocumentMapper:
+    def __init__(self, jsonl_path:str="map.jsonl"):
+        self.db=[]
+        self.path=jsonl_path
+        with open(jsonl_path,"w"):
+            pass
+
+    def upload(self,**kwargs):
+        '''
+        上传评书文件后，用DocumentMapper.upload更新filepath和document_id的对应关系
+        参数应包括：filepath,document_id
+        '''
+        self.db.append(kwargs)
+        self._update_jsonl()
+
+    def _update_jsonl(self):
+        with open(self.path,"w") as f:
+            f.writelines(
+                [json.dumps(item) for item in self.db]
+            )
+             
+    def fuzzy_search_document(self, query, threshold=30): # deprecated
+        uuid_results = []
+        lower_query = query.lower()
+        for doc_info in self.db:
+            if not isinstance(doc_info, dict) or 'filename' not in doc_info or 'document_id' not in doc_info:
+                logger.warning(f"[DocumentMapper.fuzzy_search_document] 发现无效的文档数据格式，跳过: {doc_info}")
+                continue
+            filename_in_db = doc_info['filename']
+            document_id = doc_info['document_id']
+            lower_filename_in_db = filename_in_db.lower()
+            score = fuzz.partial_ratio(lower_query, lower_filename_in_db)
+            doc_info={
+                    'filename': filename_in_db,
+                    'document_id': document_id,
+                    'score': score
+                }
+            logger.debug(f"[DocumentMapper.fuzzy_search_document] (all scores) {doc_info=}")
+            if score >= threshold:
+                uuid_results.append(doc_info)
+
+        uuid_results.sort(key=lambda x: x['score'], reverse=True)
+        return uuid_results
+    
+    def find_document_id(self,query,threshold=30) -> str|None:
+        '''查找文档id
+
+        :param query: 检索filename的关键词
+        :param threshold: 匹配阈值，超过此阈值认为可能匹配,范围: 0~100, defaults to 70
+        :return: 返回查找到的书籍id或者None(not found)
+        '''
+        # fuzzy_search_results=self.fuzzy_search_document(query,threshold)
+        fuzzy_search_results = []
+        lower_query = query.lower()
+        for doc_info in self.db:
+            if not isinstance(doc_info, dict) or 'filename' not in doc_info or 'document_id' not in doc_info:
+                logger.warning(f"[DocumentMapper.fuzzy_search_document] 发现无效的文档数据格式，跳过: {doc_info}")
+                continue
+            filename_in_db = doc_info['filename']
+            document_id = doc_info['document_id']
+            lower_filename_in_db = filename_in_db.lower()
+            score = fuzz.partial_ratio(lower_query, lower_filename_in_db)
+            doc_info={
+                    'filename': filename_in_db,
+                    'document_id': document_id,
+                    'score': score
+                }
+            logger.debug(f"[DocumentMapper.fuzzy_search_document] (all scores) {doc_info=}")
+            if score >= threshold:
+                fuzzy_search_results.append(doc_info)
+        fuzzy_search_results.sort(key=lambda x: x['score'], reverse=True)
+
+        # logger.debug(f"[DocumentMapper.find_document_id] {fuzzy_search_results=}")
+        try:
+            best_match=fuzzy_search_results[0]
+            return best_match['document_id']
+        except IndexError:
+            logger.warning(f"[DocumentMapper.find_document_id] Document not found, query: {query}, threshold: {threshold}")
+            return ''
+
+    @classmethod
+    def remove_all_documents():
+        shutil.rmtree(UPLOAD_FOLDER)
+
+doc_mapper=DocumentMapper(jsonl_path=DOCUMENT_MAPPER_JSONL)
 
 # --- 辅助函数 ---
 
@@ -191,11 +278,6 @@ def _transcription_process(document_id: str, full_text: str):
         logger.error(f"An unexpected error occurred during streaming transcription for document ID {document_id}: {e}", exc_info=True)
         yield f"\n[整体转述过程中发生严重错误: {e}]\n" # 将致命错误也嵌入流中
 
-def remove_all_documents():
-    shutil.rmtree(UPLOAD_FOLDER)
-
-# def get_document_id()
-
 @transcripts_bp.before_app_request
 def setup_folders():
     """在应用第一次请求前确保上传文件夹存在。"""
@@ -241,8 +323,9 @@ def upload_document():
     try:
         file.save(filepath)
         logger.debug(f"original filename: {original_filename}")
-        logger.info(f"File uploaded successfully. filepath: {filepath}, fileid: {document_id}")
-        doc_db.update(dict(filepath=filepath,document_id=document_id))
+        logger.info(f"File uploaded successfully. filepath: {filepath}, document id: {document_id}")
+        # doc_db.append(dict(filepath=filepath,document_id=document_id))
+        doc_mapper.upload(filename=original_filename,document_id=document_id)
         return document_id, 200
     except Exception as e:
         logger.error(f"Failed to save file {original_filename} to {filepath}: {e}", exc_info=True)
@@ -282,10 +365,41 @@ def document_transcript(document_id):
         logger.error(f"An unexpected error occurred before starting stream for document ID {document_id}: {e}", exc_info=True)
         return f"Error: An unexpected server error occurred - {str(e)}", 500
 
-@transcripts_bp.route("/documents/<document_id>/stream-transcript", methods=['GET'])
+@transcripts_bp.route("/documents/transcript/<document_id>", methods=['GET'])
 def document_transcript_endpoint(document_id):
     from flask import Response,stream_with_context
     return Response(stream_with_context(document_transcript(document_id)), mimetype='text/plain')
+
+@transcripts_bp.route("/documents/query", methods=['POST'])
+def document_id_query():
+    """
+    通过 POST 请求查询，使用书名作为query，并进行模糊搜索
+    返回cocument_id和status_code
+    example POST: '{"query": "report", "threshold": 75}'
+    """
+    if not request.is_json:
+        errmsg="[document_id_query] Request must be json"
+        logger.error(errmsg)
+        return errmsg, 400
+
+    data = json.loads(request.get_json())
+    query = data.get('query')
+
+    if not query:
+        errmsg="[document_id_query] Missing 'query' filed in request body"
+        logger.error(errmsg)
+        return errmsg, 400
+
+    # 假设你可能也想从请求中获取阈值，如果没提供则使用默认值
+    threshold = data.get('threshold', 70) 
+
+    # 调用你的 doc_mapper 进行模糊搜索
+    found_document_id = doc_mapper.find_document_id(query, threshold=threshold)
+    # logger.debug(f"(best match document_id) {found_document_id=}")
+    if found_document_id:
+        return found_document_id, 200
+    else:
+        return '',404
 
 @transcripts_bp.app_errorhandler(413)
 def request_entity_too_large(error):

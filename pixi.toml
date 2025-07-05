@@ -12,6 +12,7 @@ debug="flask --app main.py run --debug"
 [dependencies]
 aiohttp = ">=3.12.13,<4"
 requests = ">=2.32.4,<3"
+rapidfuzz = ">=3.13.0,<4"
 
 [pypi-dependencies]
 python-dotenv="*"
